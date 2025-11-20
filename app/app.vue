@@ -20,8 +20,15 @@
         threadId: string
         subject: string
         from: string
+        to: string
         date: string
-        snippet: string
+        body: string
+        accountEmail: string
+    }
+
+    interface AccountSession {
+        email: string
+        token: string
     }
 
     type StatusKind = "idle" | "info" | "success" | "error"
@@ -42,6 +49,8 @@
     const gapiReady = ref(false)
     const tokenClient = ref<any | null>(null)
     const accessToken = ref("")
+    const accounts = ref<AccountSession[]>([])
+    const selectedAccounts = ref<string[]>([])
     const isSignedIn = ref(false)
     const statusText = ref("Provide your Client ID and API key, then authorize access to Gmail.")
     const statusType = ref<StatusKind>("info")
@@ -347,7 +356,7 @@
     }
 
     const requestAccessToken = () =>
-        new Promise<void>((resolve, reject) => {
+        new Promise<string>((resolve, reject) => {
             if (!tokenClient.value) {
                 reject(new Error("Token client not ready."))
                 return
@@ -381,7 +390,7 @@
                 window.gapi?.client?.setToken(tokenResponse)
                 isSignedIn.value = true
                 logInfo("Received Gmail access token")
-                resolve()
+                resolve(tokenResponse.access_token)
             }
 
             const handleError = (errorResponse: any) => {
@@ -413,9 +422,13 @@
             setStatus("Preparing Google authorization flow…", "info")
             logInfo("Starting Gmail authorization flow")
             await initClient()
-            await requestAccessToken()
+            const token = await requestAccessToken()
+
+            const profileEmail = await fetchUserProfile()
+            addOrUpdateAccount(profileEmail, token)
+
             setStatus("Authorization successful. You can now search Gmail.", "success")
-            logInfo("Gmail authorization completed")
+            logInfo("Gmail authorization completed", { profileEmail })
         } catch (error) {
             logError("Gmail authorization failed", { error })
             setStatus(normalizeError(error, "Authorization failed."), "error")
@@ -426,19 +439,22 @@
 
     const signOut = async () => {
         logInfo("Signing out from Gmail")
-        if (accessToken.value) {
+        const googleAccounts = window.google?.accounts?.oauth2
+        const tokensToRevoke = accounts.value.map((account) => account.token).filter(Boolean)
+        for (const token of tokensToRevoke) {
             await new Promise<void>((resolve) => {
-                const googleAccounts = window.google?.accounts?.oauth2
                 if (!googleAccounts) {
                     resolve()
                     return
                 }
-                googleAccounts.revoke(accessToken.value, () => resolve())
+                googleAccounts.revoke(token, () => resolve())
             })
         }
 
         window.gapi?.client?.setToken(null)
         accessToken.value = ""
+        accounts.value = []
+        selectedAccounts.value = []
         isSignedIn.value = false
         messages.value = []
         setStatus("Disconnected from Gmail.", "info")
@@ -449,6 +465,56 @@
         headers: Array<{ name: string; value: string }> | undefined,
         name: string
     ) => headers?.find((header) => header.name.toLowerCase() === name.toLowerCase())?.value ?? ""
+
+    const fetchUserProfile = async (): Promise<string> => {
+        const gapi = window.gapi
+        const response = await gapi.client.gmail.users.getProfile({ userId: "me" })
+        const email = response.result.emailAddress || "unknown"
+        logInfo("Fetched Gmail profile", { email })
+        return email
+    }
+
+    const addOrUpdateAccount = (email: string, token: string) => {
+        const existing = accounts.value.find((account) => account.email === email)
+        if (existing) {
+            existing.token = token
+        } else {
+            accounts.value.push({ email, token })
+        }
+
+        if (!selectedAccounts.value.includes(email)) {
+            selectedAccounts.value.push(email)
+        }
+
+        isSignedIn.value = accounts.value.length > 0
+        logInfo("Account stored", { email, total: accounts.value.length })
+    }
+
+    const extractPlainBody = (payload: any): string => {
+        if (!payload) {
+            return ""
+        }
+
+        const mimeType = payload.mimeType || ""
+        if (payload.body?.data && mimeType.startsWith("text/plain")) {
+            try {
+                return atob(payload.body.data.replace(/-/g, "+").replace(/_/g, "/"))
+            } catch {
+                return ""
+            }
+        }
+
+        if (Array.isArray(payload.parts)) {
+            for (const part of payload.parts) {
+                const text = extractPlainBody(part)
+                if (text) {
+                    return text
+                }
+            }
+        }
+
+        return ""
+    }
 
     const searchMailbox = async () => {
         if (!readyForSearch.value) {
@@ -461,55 +527,82 @@
             return
         }
 
+        const targets = selectedAccounts.value.length ? selectedAccounts.value : accounts.value.map((a) => a.email)
+        if (!targets.length) {
+            setStatus("Authorize at least one account before searching.", "error")
+            return
+        }
+
         loadingSearch.value = true
         setStatus("Contacting Gmail...", "info")
-        logInfo("Searching Gmail mailbox", { query: searchQuery.value.trim() })
+        logInfo("Searching Gmail mailbox", { query: searchQuery.value.trim(), accounts: targets })
 
         try {
             const gapi = window.gapi
-            const listResponse = await gapi.client.gmail.users.messages.list({
-                userId: "me",
-                q: searchQuery.value.trim(),
-                maxResults: 10,
-            })
+            const aggregated: GmailMessage[] = []
 
-            const candidateMessages = listResponse.result.messages ?? []
-            if (!candidateMessages.length) {
-                messages.value = []
+            for (const email of targets) {
+                const account = accounts.value.find((a) => a.email === email)
+                if (!account) {
+                    logWarn("Skipping missing account", { email })
+                    continue
+                }
+
+                gapi.client.setToken({ access_token: account.token })
+
+                const listResponse = await gapi.client.gmail.users.messages.list({
+                    userId: "me",
+                    q: searchQuery.value.trim(),
+                    maxResults: 10,
+                })
+
+                const candidateMessages = listResponse.result.messages ?? []
+                if (!candidateMessages.length) {
+                    logInfo("No messages for account", { email })
+                    continue
+                }
+
+                const detailedMessages = await Promise.all(
+                    candidateMessages.map(async (message: { id: string; threadId: string }) => {
+                        const detail = await gapi.client.gmail.users.messages.get({
+                            userId: "me",
+                            id: message.id,
+                            format: "full",
+                        })
+
+                        const headers = detail.result.payload?.headers ?? []
+                        const bodyText = extractPlainBody(detail.result.payload)
+                        const result: GmailMessage = {
+                            id: message.id,
+                            threadId: message.threadId,
+                            subject: parseHeader(headers, "Subject") || "(No subject)",
+                            from: parseHeader(headers, "From") || "Unknown sender",
+                            to: parseHeader(headers, "To") || "Unknown recipient",
+                            date: parseHeader(headers, "Date") || "Unknown date",
+                            body: bodyText || detail.result.snippet || "",
+                            accountEmail: email,
+                        }
+                        return result
+                    })
+                )
+
+                aggregated.push(...detailedMessages)
+            }
+
+            messages.value = aggregated
+
+            if (!aggregated.length) {
                 setStatus("No messages matched your query.", "info")
                 return
             }
 
-            const detailedMessages = await Promise.all(
-                candidateMessages.map(async (message: { id: string; threadId: string }) => {
-                    const detail = await gapi.client.gmail.users.messages.get({
-                        userId: "me",
-                        id: message.id,
-                        format: "metadata",
-                        metadataHeaders: ["Subject", "From", "Date"],
-                    })
-
-                    const headers = detail.result.payload?.headers ?? []
-                    const result: GmailMessage = {
-                        id: message.id,
-                        threadId: message.threadId,
-                        subject: parseHeader(headers, "Subject") || "(No subject)",
-                        from: parseHeader(headers, "From") || "Unknown sender",
-                        date: parseHeader(headers, "Date") || "Unknown date",
-                        snippet: detail.result.snippet ?? "",
-                    }
-                    return result
-                })
-            )
-
-            messages.value = detailedMessages
             setStatus(
-                `Fetched ${detailedMessages.length} message${
-                    detailedMessages.length === 1 ? "" : "s"
-                }.`,
+                `Fetched ${aggregated.length} message${aggregated.length === 1 ? "" : "s"} from ${
+                    targets.length
+                } account${targets.length === 1 ? "" : "s"}.`,
                 "success"
             )
-            logInfo("Fetched Gmail messages", { count: detailedMessages.length })
+            logInfo("Fetched Gmail messages", { count: aggregated.length, accounts: targets.length })
         } catch (error) {
             logError("Gmail search failed", { error })
             setStatus(normalizeError(error, "Unable to search Gmail."), "error")
@@ -640,6 +733,31 @@
                         <strong>{{ isSignedIn ? "Connected" : "Not connected" }}</strong>
                     </li>
                 </ul>
+
+                <div
+                    v-if="accounts.length"
+                    class="accounts"
+                >
+                    <div class="accounts__header">
+                        <p class="accounts__title">Authorized accounts</p>
+                        <p class="accounts__subtitle">Select which inboxes to include in searches.</p>
+                    </div>
+
+                    <div class="accounts__list">
+                        <label
+                            v-for="account in accounts"
+                            :key="account.email"
+                            class="account-chip"
+                        >
+                            <input
+                                v-model="selectedAccounts"
+                                type="checkbox"
+                                :value="account.email"
+                            />
+                            <span>{{ account.email }}</span>
+                        </label>
+                    </div>
+                </div>
             </section>
 
             <section class="panel">
@@ -694,24 +812,32 @@
                     >
                         No messages loaded yet.
                     </p>
-                    <div v-else>
-                        <article
-                            v-for="message in messages"
-                            :key="message.id"
-                            class="message"
-                        >
-                            <header>
-                                <div>
-                                    <p class="message__from">{{ message.from }}</p>
-                                    <p class="message__subject">{{ message.subject }}</p>
-                                </div>
-                                <p class="message__date">{{ message.date }}</p>
-                            </header>
-                            <p class="message__snippet">{{ message.snippet }}</p>
-                            <footer>
-                                <code>Message ID: {{ message.id }}</code>
-                            </footer>
-                        </article>
+                    <div v-else class="table-wrapper">
+                        <table class="messages-table">
+                            <thead>
+                                <tr>
+                                    <th>Account</th>
+                                    <th>From</th>
+                                    <th>To</th>
+                                    <th>Subject</th>
+                                    <th>Date</th>
+                                    <th>Body</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr
+                                    v-for="message in messages"
+                                    :key="message.id"
+                                >
+                                    <td>{{ message.accountEmail }}</td>
+                                    <td>{{ message.from }}</td>
+                                    <td>{{ message.to }}</td>
+                                    <td>{{ message.subject }}</td>
+                                    <td>{{ message.date }}</td>
+                                    <td class="body-cell">{{ message.body }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </section>
@@ -963,15 +1089,64 @@
         font-size: 0.85rem;
     }
 
-    .status-list strong {
-        color: #0f172a;
-    }
+.status-list strong {
+    color: #0f172a;
+}
 
-    .search {
-        display: flex;
-        flex-direction: column;
-        gap: 16px;
-    }
+.accounts {
+    border: 1px dashed #cbd5e1;
+    border-radius: 12px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.accounts__header {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.accounts__title {
+    margin: 0;
+    font-weight: 700;
+    color: #0f172a;
+}
+
+.accounts__subtitle {
+    margin: 0;
+    color: #475569;
+    font-size: 0.9rem;
+}
+
+.accounts__list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+
+.account-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-radius: 999px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    color: #0f172a;
+    cursor: pointer;
+}
+
+.account-chip input {
+    accent-color: #6366f1;
+}
+
+.search {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
 
     .placeholder {
         padding: 16px;
@@ -980,55 +1155,43 @@
         color: #475569;
     }
 
-    .results {
-        display: flex;
-        flex-direction: column;
-        gap: 16px;
-    }
+.results {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
 
-    .message {
-        border: 1px solid #e2e8f0;
-        border-radius: 18px;
-        padding: 20px;
-        display: flex;
-        flex-direction: column;
-        gap: 12px;
-        background: #fff;
-    }
+.table-wrapper {
+    width: 100%;
+    overflow-x: auto;
+}
 
-    .message header {
-        display: flex;
-        justify-content: space-between;
-        gap: 16px;
-        flex-wrap: wrap;
-    }
+.messages-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.95rem;
+}
 
-    .message__from {
-        font-weight: 600;
-        color: #0f172a;
-        margin: 0;
-    }
+.messages-table th,
+.messages-table td {
+    padding: 12px 10px;
+    border-bottom: 1px solid #e2e8f0;
+    text-align: left;
+}
 
-    .message__subject {
-        margin: 4px 0 0;
-        color: #4338ca;
-    }
+.messages-table th {
+    background: #f8fafc;
+    color: #0f172a;
+    position: sticky;
+    top: 0;
+}
 
-    .message__date {
-        margin: 0;
-        color: #475569;
-        font-size: 0.9rem;
-    }
-
-    .message__snippet {
-        margin: 0;
-        color: #475569;
-    }
-
-    .message footer {
-        font-size: 0.75rem;
-        color: #94a3b8;
-    }
+.body-cell {
+    max-width: 320px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: #475569;
+}
 
     @media (max-width: 720px) {
         .gmail-card {
