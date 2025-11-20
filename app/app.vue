@@ -128,6 +128,14 @@
             match: (message) => message.includes("popup_blocked_by_browser"),
             hint: "Your browser blocked Google's popup. Allow popups for this site and try again.",
         },
+        {
+            match: (message) =>
+                message.toLowerCase().includes("api key not valid") ||
+                message.toLowerCase().includes("api key") ||
+                message.toLowerCase().includes("key") && message.toLowerCase().includes("invalid"),
+            hint:
+                "API key appears invalid or restricted. Make sure the key is unrestricted or allows http://localhost:3000 as an HTTP referrer and that the Gmail API is enabled for the project. You can also leave the API key blank and rely on OAuth only.",
+        },
     ]
 
     const extractGoogleErrorMessage = (error: unknown) => {
@@ -148,6 +156,16 @@
 
         if (typeof maybeError.error_description === "string" && maybeError.error_description.trim()) {
             return maybeError.error_description.trim()
+        }
+
+        if (
+            maybeError.error &&
+            typeof maybeError.error === "object" &&
+            "message" in maybeError.error &&
+            typeof (maybeError.error as Record<string, unknown>).message === "string"
+        ) {
+            const structured = maybeError.error as { message: string; status?: string }
+            return structured.status ? `${structured.status}: ${structured.message}` : structured.message
         }
 
         if (typeof maybeError.error === "string" && maybeError.error.trim()) {
@@ -186,12 +204,12 @@
     }
 
     const ensureCredentials = () => {
-        if (!clientId.value.trim() || !apiKey.value.trim()) {
-            logWarn("Missing credentials", {
-                hasClientId: Boolean(clientId.value.trim()),
-                hasApiKey: Boolean(apiKey.value.trim()),
-            })
-            throw new Error("Client ID and API key are required.")
+        if (!clientId.value.trim()) {
+            logWarn("Missing client ID")
+            throw new Error("Client ID is required.")
+        }
+        if (!apiKey.value.trim()) {
+            logWarn("API key not provided; continuing without a key")
         }
     }
 
@@ -299,10 +317,17 @@
         await new Promise<void>((resolve, reject) => {
             gapi.load("client", async () => {
                 try {
-                    await gapi.client.init({
-                        apiKey: apiKey.value.trim(),
+                    const initOptions: Record<string, any> = { discoveryDocs }
+                    if (apiKey.value.trim()) {
+                        initOptions.apiKey = apiKey.value.trim()
+                    }
+
+                    logInfo("Initializing gapi client with config", {
+                        hasApiKey: Boolean(initOptions.apiKey),
                         discoveryDocs,
                     })
+
+                    await gapi.client.init(initOptions)
 
                     setupTokenClient()
 
@@ -538,7 +563,7 @@
                             type="text"
                             name="api-key"
                             autocomplete="off"
-                            placeholder="AIzaSy..."
+                            placeholder="Optional – leave blank to rely on OAuth"
                         />
                     </label>
                 </div>
