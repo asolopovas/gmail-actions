@@ -28,7 +28,9 @@
 
     interface AccountSession {
         email: string
-        token: string
+        token?: string
+        lastAuthorized?: string
+        needsConsent?: boolean
     }
 
     type StatusKind = "idle" | "info" | "success" | "error"
@@ -39,11 +41,15 @@
         clientId: "gmail-actions/client-id",
         apiKey: "gmail-actions/api-key",
         searchQuery: "gmail-actions/search-query",
+        searchScope: "gmail-actions/search-scope",
+        accounts: "gmail-actions/accounts",
+        selectedAccounts: "gmail-actions/selected-accounts",
     } as const
 
     const clientId = ref("")
     const apiKey = ref("")
     const searchQuery = ref("label:inbox newer_than:7d")
+    const searchScope = ref("anywhere")
     const googleScriptLoaded = ref(false)
     const gisScriptLoaded = ref(false)
     const gapiReady = ref(false)
@@ -85,6 +91,28 @@
     const logWarn = (message: string, meta?: LogMeta) => logMessage("warn", message, meta)
     const logError = (message: string, meta?: LogMeta) => logMessage("error", message, meta)
 
+    const normalizeAccounts = (input: unknown): AccountSession[] => {
+        if (!Array.isArray(input)) return []
+        const normalized: AccountSession[] = []
+        for (const item of input) {
+            if (typeof item === "string") {
+                normalized.push({ email: item })
+                continue
+            }
+            if (item && typeof item === "object" && "email" in item && typeof (item as any).email === "string") {
+                const candidate = item as Record<string, unknown>
+                normalized.push({
+                    email: candidate.email as string,
+                    token: typeof candidate.token === "string" ? (candidate.token as string) : undefined,
+                    lastAuthorized:
+                        typeof candidate.lastAuthorized === "string" ? (candidate.lastAuthorized as string) : undefined,
+                    needsConsent: Boolean(candidate.needsConsent),
+                })
+            }
+        }
+        return normalized
+    }
+
     const restoreStoredValues = () => {
         if (typeof window === "undefined") {
             return
@@ -93,35 +121,89 @@
         try {
             clientId.value = localStorage.getItem(STORAGE_KEYS.clientId) ?? ""
             apiKey.value = localStorage.getItem(STORAGE_KEYS.apiKey) ?? ""
+            searchScope.value = localStorage.getItem(STORAGE_KEYS.searchScope) ?? "anywhere"
+
             const storedQuery = localStorage.getItem(STORAGE_KEYS.searchQuery)
             if (storedQuery) {
                 searchQuery.value = storedQuery
             }
+
+            const storedAccounts = localStorage.getItem(STORAGE_KEYS.accounts)
+            if (storedAccounts) {
+                accounts.value = normalizeAccounts(JSON.parse(storedAccounts))
+            }
+
+            const storedSelected = localStorage.getItem(STORAGE_KEYS.selectedAccounts)
+            if (storedSelected) {
+                const parsed = JSON.parse(storedSelected)
+                selectedAccounts.value = Array.isArray(parsed)
+                    ? parsed.filter((item: unknown) => typeof item === "string")
+                    : []
+            }
+
+            const validEmails = new Set(accounts.value.map((a) => a.email))
+            selectedAccounts.value = selectedAccounts.value.filter((email) => validEmails.has(email))
+
+            if (!selectedAccounts.value.length && accounts.value.length) {
+                selectedAccounts.value = accounts.value.map((a) => a.email)
+            }
+
             logDebug("Restored stored values", {
                 hasClientId: Boolean(clientId.value),
                 hasApiKey: Boolean(apiKey.value),
                 hasQuery: Boolean(searchQuery.value),
+                storedAccounts: accounts.value.length,
+                selectedAccounts: selectedAccounts.value.length,
+                scope: searchScope.value,
             })
         } catch (error) {
             logWarn("Unable to restore stored values", { error })
         }
     }
 
-    onMounted(() => {
+    const persistAccounts = () => {
+        if (typeof window === "undefined") return
+        localStorage.setItem(STORAGE_KEYS.accounts, JSON.stringify(accounts.value))
+        localStorage.setItem(STORAGE_KEYS.selectedAccounts, JSON.stringify(selectedAccounts.value))
+    }
+
+    onMounted(async () => {
         isClient.value = true
         currentOrigin.value = window.location.origin
         restoreStoredValues()
+
+        if (accounts.value.length) {
+            isSignedIn.value = true
+        }
+
+        if (clientId.value.trim()) {
+            try {
+                await initClient()
+            } catch (error) {
+                logWarn("Auto-initialization failed", { error })
+            }
+        }
     })
 
     if (typeof window !== "undefined") {
         watch(clientId, (value) => {
             localStorage.setItem(STORAGE_KEYS.clientId, value.trim())
         })
-        watch(apiKey, (value) => {
-            localStorage.setItem(STORAGE_KEYS.apiKey, value.trim())
-        })
         watch(searchQuery, (value) => {
             localStorage.setItem(STORAGE_KEYS.searchQuery, value)
+        })
+        watch(searchScope, (value) => {
+            localStorage.setItem(STORAGE_KEYS.searchScope, value)
+        })
+        watch(
+            accounts,
+            () => {
+                persistAccounts()
+            },
+            { deep: true }
+        )
+        watch(selectedAccounts, (value) => {
+            localStorage.setItem(STORAGE_KEYS.selectedAccounts, JSON.stringify(value))
         })
     }
 
@@ -296,7 +378,10 @@
             document.head.appendChild(script)
         })
 
-    const setupTokenClient = () => {
+    const setupTokenClient = (force = false) => {
+        if (tokenClient.value && !force) {
+            return
+        }
         const googleAccounts = window.google?.accounts?.oauth2
         if (!googleAccounts) {
             throw new Error("Google Identity Services client not available.")
@@ -346,6 +431,7 @@
                     gapiReady.value = true
                     setStatus("Google API client is initialized.", "success")
                     logInfo("Google API client initialized")
+                    await restoreAccountsSilently()
                     resolve()
                 } catch (err) {
                     logError("Failed to initialize Google API client", { error: err })
@@ -355,15 +441,23 @@
         })
     }
 
-    const requestAccessToken = () =>
+    const requestAccessToken = (
+        options?: {
+            promptMode?: "none" | "consent"
+            hint?: string
+            forcePrompt?: boolean
+            forceSelectAccount?: boolean
+        }
+    ) =>
         new Promise<string>((resolve, reject) => {
-            if (!tokenClient.value) {
-                reject(new Error("Token client not ready."))
-                return
+            if (!tokenClient.value || options?.forcePrompt || options?.forceSelectAccount) {
+                setupTokenClient(true)
             }
 
-            const promptMode = accessToken.value ? "none" : "consent"
-            logInfo("Requesting Gmail access token", { prompt: promptMode })
+            const promptMode = options?.forcePrompt
+                ? "consent"
+                : options?.promptMode ?? (accessToken.value ? "none" : "consent")
+            logInfo("Requesting Gmail access token", { prompt: promptMode, hint: options?.hint })
             let settled = false
             const cleanup = () => {
                 settled = true
@@ -406,8 +500,11 @@
                 tokenClient.value.callback = handleSuccess
                 ;(tokenClient.value as Record<string, any>).error_callback = handleError
                 const requestOptions: Record<string, string> = {}
-                if (promptMode === "consent") {
-                    requestOptions.prompt = "consent"
+                if (promptMode === "consent" || options?.forceSelectAccount) {
+                    requestOptions.prompt = options?.forceSelectAccount ? "consent select_account" : "consent"
+                }
+                if (options?.hint) {
+                    requestOptions.login_hint = options.hint
                 }
                 tokenClient.value.requestAccessToken(requestOptions)
             } catch (error) {
@@ -422,11 +519,74 @@
             setStatus("Preparing Google authorization flow…", "info")
             logInfo("Starting Gmail authorization flow")
             await initClient()
-            const token = await requestAccessToken()
+            const token = await requestAccessToken({ promptMode: "consent", forcePrompt: true, forceSelectAccount: true })
 
             const profileEmail = await fetchUserProfile()
             addOrUpdateAccount(profileEmail, token)
 
+            setStatus("Authorization successful. You can now search Gmail.", "success")
+            logInfo("Gmail authorization completed", { profileEmail })
+        } catch (error) {
+            logError("Gmail authorization failed", { error })
+            setStatus(normalizeError(error, "Authorization failed."), "error")
+        } finally {
+            loadingAuthorize.value = false
+        }
+    }
+
+    const authorizeAccount = async (hint?: string, opts?: { forcePrompt?: boolean; forceSelectAccount?: boolean }) => {
+        loadingAuthorize.value = true
+        try {
+            setStatus("Preparing Google authorization flow…", "info")
+            await initClient()
+
+            if (opts?.forceSelectAccount) {
+                accessToken.value = ""
+                window.gapi?.client?.setToken(null)
+                const token = await requestAccessToken({
+                    promptMode: "consent",
+                    forcePrompt: true,
+                    forceSelectAccount: true,
+                })
+                const profileEmail = await fetchUserProfile()
+                addOrUpdateAccount(profileEmail, token)
+                setStatus("Authorization successful. You can now search Gmail.", "success")
+                logInfo("Gmail authorization completed", { profileEmail })
+                return
+            }
+
+            try {
+                if (opts?.forcePrompt) {
+                    accessToken.value = ""
+                    window.gapi?.client?.setToken(null)
+                }
+                const token = await requestAccessToken({
+                    promptMode: hint ? "none" : "consent",
+                    hint,
+                    forcePrompt: opts?.forcePrompt,
+                    forceSelectAccount: opts?.forceSelectAccount,
+                })
+                const profileEmail = await fetchUserProfile()
+                addOrUpdateAccount(profileEmail, token)
+                setStatus("Authorization successful. You can now search Gmail.", "success")
+                logInfo("Gmail authorization completed", { profileEmail })
+                return
+            } catch (error) {
+                if (hint) {
+                    logWarn("Silent auth failed, requesting consent", { hint, error })
+                } else {
+                    throw error
+                }
+            }
+
+            const token = await requestAccessToken({
+                promptMode: "consent",
+                hint,
+                forcePrompt: true,
+                forceSelectAccount: opts?.forceSelectAccount ?? true,
+            })
+            const profileEmail = await fetchUserProfile()
+            addOrUpdateAccount(profileEmail, token)
             setStatus("Authorization successful. You can now search Gmail.", "success")
             logInfo("Gmail authorization completed", { profileEmail })
         } catch (error) {
@@ -455,10 +615,31 @@
         accessToken.value = ""
         accounts.value = []
         selectedAccounts.value = []
+        persistAccounts()
         isSignedIn.value = false
         messages.value = []
         setStatus("Disconnected from Gmail.", "info")
         logInfo("Completed sign out")
+    }
+
+    const removeAccount = async (email: string) => {
+        const account = accounts.value.find((a) => a.email === email)
+        const googleAccounts = window.google?.accounts?.oauth2
+        if (account?.token) {
+            await new Promise<void>((resolve) => {
+                if (!googleAccounts) {
+                    resolve()
+                    return
+                }
+                googleAccounts.revoke(account.token as string, () => resolve())
+            })
+        }
+
+        accounts.value = accounts.value.filter((a) => a.email !== email)
+        selectedAccounts.value = selectedAccounts.value.filter((e) => e !== email)
+        persistAccounts()
+        isSignedIn.value = accounts.value.length > 0
+        logInfo("Removed account", { email })
     }
 
     const parseHeader = (
@@ -497,12 +678,32 @@
         return `${normalized.slice(0, limit)}…`
     }
 
+    const restoreAccountsSilently = async () => {
+        if (!accounts.value.length || !gapiReady.value) return
+
+        for (const account of accounts.value) {
+            if (!account.token) {
+                try {
+                    const token = await requestAccessToken({ promptMode: "none", hint: account.email })
+                    const profileEmail = await fetchUserProfile()
+                    addOrUpdateAccount(profileEmail, token)
+                    logInfo("Restored account silently", { email: profileEmail })
+                } catch (error) {
+                    logWarn("Silent restore failed for account without token", { email: account.email, error })
+                }
+            }
+        }
+        persistAccounts()
+    }
+
     const addOrUpdateAccount = (email: string, token: string) => {
         const existing = accounts.value.find((account) => account.email === email)
         if (existing) {
             existing.token = token
+            existing.needsConsent = false
+            existing.lastAuthorized = new Date().toISOString()
         } else {
-            accounts.value.push({ email, token })
+            accounts.value.push({ email, token, lastAuthorized: new Date().toISOString() })
         }
 
         if (!selectedAccounts.value.includes(email)) {
@@ -511,6 +712,7 @@
 
         isSignedIn.value = accounts.value.length > 0
         logInfo("Account stored", { email, total: accounts.value.length })
+        persistAccounts()
     }
 
     const extractPlainBody = (payload: any): string => {
@@ -539,6 +741,16 @@
         return ""
     }
 
+    const scopeLookup: Record<string, string> = {
+        anywhere: "",
+        inbox: "in:inbox",
+        sent: "in:sent",
+        draft: "in:drafts",
+        spam: "in:spam",
+        trash: "in:trash",
+        starred: "is:starred",
+    }
+
     const searchMailbox = async () => {
         if (!readyForSearch.value) {
             setStatus("Authorize Gmail before searching.", "error")
@@ -556,9 +768,12 @@
             return
         }
 
+        const scopeClause = scopeLookup[searchScope.value] ?? ""
+        const effectiveQuery = [scopeClause, searchQuery.value.trim()].filter(Boolean).join(" ").trim()
+
         loadingSearch.value = true
         setStatus("Contacting Gmail...", "info")
-        logInfo("Searching Gmail mailbox", { query: searchQuery.value.trim(), accounts: targets })
+        logInfo("Searching Gmail mailbox", { query: effectiveQuery, accounts: targets })
 
         try {
             const gapi = window.gapi
@@ -571,11 +786,22 @@
                     continue
                 }
 
+                if (!account.token) {
+                    logWarn("Account missing token; requesting consent", { email })
+                    try {
+                        const token = await requestAccessToken({ promptMode: "consent", hint: account.email })
+                        addOrUpdateAccount(account.email, token)
+                    } catch (error) {
+                        logError("Failed to refresh token for account", { email, error })
+                        continue
+                    }
+                }
+
                 gapi.client.setToken({ access_token: account.token })
 
                 const listResponse = await gapi.client.gmail.users.messages.list({
                     userId: "me",
-                    q: searchQuery.value.trim(),
+                    q: effectiveQuery,
                     maxResults: 10,
                 })
 
@@ -642,10 +868,7 @@
             <header class="gmail-card__header">
                 <p class="eyebrow">Gmail actions</p>
                 <h1>Search Gmail across multiple accounts</h1>
-                <p class="lede">
-                    Connect multiple Gmail accounts, select which inboxes to include, and review matched
-                    messages in compact cards.
-                </p>
+            <p class="lede">Connect multiple Gmail accounts, choose which inboxes to include, and review matches quickly.</p>
             </header>
 
             <div
@@ -677,28 +900,85 @@
                         />
                     </label>
 
-                    <div
-                        v-if="accounts.length"
-                        class="accounts"
-                    >
+                    <label class="form-field">
+                        <span>Folder / scope</span>
+                        <select
+                            v-model="searchScope"
+                            :disabled="!readyForSearch"
+                        >
+                            <option value="anywhere">All mail</option>
+                            <option value="inbox">Inbox</option>
+                            <option value="sent">Sent</option>
+                            <option value="draft">Drafts</option>
+                            <option value="spam">Spam</option>
+                            <option value="trash">Trash</option>
+                            <option value="starred">Starred</option>
+                        </select>
+                    </label>
+
+                    <div class="accounts">
                         <div class="accounts__header">
-                            <p class="accounts__title">Authorized accounts</p>
-                            <p class="accounts__subtitle">Select inboxes to search.</p>
+                            <div>
+                                <p class="accounts__title">Authorized accounts</p>
+                                <p class="accounts__subtitle">Select inboxes and manage tokens.</p>
+                            </div>
+                            <button
+                                class="btn btn--ghost"
+                                type="button"
+                                :disabled="loadingAuthorize"
+                                @click="authorizeAccount(undefined, { forcePrompt: true, forceSelectAccount: true })"
+                            >
+                                + Add account
+                            </button>
                         </div>
 
-                        <div class="accounts__list">
-                            <label
+                        <div
+                            v-if="accounts.length"
+                            class="accounts__list"
+                        >
+                            <div
                                 v-for="account in accounts"
                                 :key="account.email"
-                                class="account-chip"
+                                class="account-row"
                             >
-                                <input
-                                    v-model="selectedAccounts"
-                                    type="checkbox"
-                                    :value="account.email"
-                                />
-                                <span>{{ account.email }}</span>
-                            </label>
+                                <label class="account-row__main">
+                                    <input
+                                        v-model="selectedAccounts"
+                                        type="checkbox"
+                                        :value="account.email"
+                                    />
+                                    <div>
+                                        <p class="account-row__email">{{ account.email }}</p>
+                                        <p class="account-row__status">
+                                            {{ account.token ? "Connected" : "Needs auth" }}
+                                            <span v-if="account.needsConsent" class="pill pill--warn">Re-auth required</span>
+                                        </p>
+                                    </div>
+                                </label>
+                                <div class="account-row__actions">
+                                    <button
+                                        class="btn btn--ghost btn--tiny"
+                                        type="button"
+                                        :disabled="loadingAuthorize"
+                                        @click="authorizeAccount(account.email)"
+                                    >
+                                        Refresh
+                                    </button>
+                                    <button
+                                        class="btn btn--ghost btn--tiny btn--danger"
+                                        type="button"
+                                        @click="removeAccount(account.email)"
+                                    >
+                                        Remove
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                        <div
+                            v-else
+                            class="placeholder"
+                        >
+                            No accounts yet. Add one to begin searching.
                         </div>
                     </div>
 
@@ -747,16 +1027,16 @@
                                     <p class="email-card__date">{{ message.date }}</p>
                                 </div>
                             </header>
-                            <p class="email-card__body">{{ message.body }}</p>
-                        </article>
-                    </div>
-                </div>
-            </section>
+                    <p class="email-card__body">{{ message.body }}</p>
+                </article>
+            </div>
+        </div>
+    </section>
 
             <section class="panel">
                 <div class="panel__title">
-                    <h2>Authorization</h2>
-                    <p>Use your Web OAuth Client ID (no API key needed) and connect Gmail.</p>
+                    <h2>Settings</h2>
+                    <p>Provide your Web OAuth Client ID for Gmail.</p>
                 </div>
 
                 <div class="form-grid">
@@ -770,25 +1050,6 @@
                             placeholder="1234567890-example.apps.googleusercontent.com"
                         />
                     </label>
-                </div>
-
-                <div class="actions">
-                    <button
-                        class="btn"
-                        type="button"
-                        :disabled="loadingAuthorize"
-                        @click="authorizeGmail"
-                    >
-                        {{ loadingAuthorize ? "Authorizing…" : "Authorize Gmail" }}
-                    </button>
-                    <button
-                        class="btn btn--ghost"
-                        type="button"
-                        :disabled="!isSignedIn"
-                        @click="signOut"
-                    >
-                        Disconnect
-                    </button>
                 </div>
 
                 <ul class="status-list">
@@ -805,8 +1066,8 @@
                         <strong>{{ gapiReady ? "Initialized" : "Not initialized" }}</strong>
                     </li>
                     <li>
-                        <span>Authorization</span>
-                        <strong>{{ isSignedIn ? "Connected" : "Not connected" }}</strong>
+                        <span>Accounts</span>
+                        <strong>{{ accounts.length ? `${accounts.length} connected` : "None" }}</strong>
                     </li>
                 </ul>
             </section>
@@ -920,7 +1181,8 @@
         color: #0f172a;
     }
 
-    .form-field input {
+    .form-field input,
+    .form-field select {
         border-radius: 12px;
         border: 1px solid #e2e8f0;
         padding: 12px 14px;
@@ -928,7 +1190,8 @@
         transition: border-color 0.2s, box-shadow 0.2s;
     }
 
-    .form-field input:focus {
+    .form-field input:focus,
+    .form-field select:focus {
         border-color: #6366f1;
         outline: none;
         box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
@@ -1005,7 +1268,9 @@
 
 .accounts__header {
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
+    justify-content: space-between;
+    align-items: center;
     gap: 4px;
 }
 
@@ -1023,24 +1288,57 @@
 
 .accounts__list {
     display: flex;
-    flex-wrap: wrap;
+    flex-direction: column;
     gap: 10px;
 }
 
-.account-chip {
-    display: inline-flex;
+.account-row {
+    display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    border-radius: 999px;
-    background: #f8fafc;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
     border: 1px solid #e2e8f0;
-    color: #0f172a;
+    border-radius: 12px;
+    background: #f8fafc;
+}
+
+.account-row__main {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0;
     cursor: pointer;
 }
 
-.account-chip input {
-    accent-color: #6366f1;
+.account-row__email {
+    margin: 0;
+    font-weight: 600;
+    color: #0f172a;
+}
+
+.account-row__status {
+    margin: 2px 0 0;
+    color: #475569;
+    font-size: 0.85rem;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.account-row__actions {
+    display: flex;
+    gap: 8px;
+}
+
+.btn--tiny {
+    padding: 8px 12px;
+    font-size: 0.9rem;
+}
+
+.btn--danger {
+    background: rgba(239, 68, 68, 0.12);
+    color: #b91c1c;
 }
 
 .search {
@@ -1129,6 +1427,11 @@
         background: #eef2ff;
         color: #312e81;
         font-size: 0.85rem;
+    }
+
+    .pill--warn {
+        background: #fef3c7;
+        color: #92400e;
     }
 
     @media (max-width: 720px) {
