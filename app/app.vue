@@ -4,6 +4,14 @@
     declare global {
         interface Window {
             gapi?: any
+            google?: {
+                accounts?: {
+                    oauth2?: {
+                        initTokenClient: (config: Record<string, unknown>) => any
+                        revoke: (token: string, done: () => void) => void
+                    }
+                }
+            }
         }
     }
 
@@ -30,8 +38,10 @@
     const apiKey = ref("")
     const searchQuery = ref("label:inbox newer_than:7d")
     const googleScriptLoaded = ref(false)
+    const gisScriptLoaded = ref(false)
     const gapiReady = ref(false)
-    const authInstance = ref<any | null>(null)
+    const tokenClient = ref<any | null>(null)
+    const accessToken = ref("")
     const isSignedIn = ref(false)
     const statusText = ref("Provide your Client ID and API key, then authorize access to Gmail.")
     const statusType = ref<StatusKind>("info")
@@ -43,6 +53,28 @@
     const oauthRedirectUri = computed(() =>
         currentOrigin.value ? `${currentOrigin.value}/oauth2callback` : "Add custom redirect URI if needed"
     )
+    const nuxtApp = useNuxtApp()
+    const loggerTarget = (nuxtApp.$logger as Partial<Console> | undefined) ?? console
+
+    type LogMeta = Record<string, unknown>
+    type LogLevel = "debug" | "info" | "warn" | "error"
+
+    const logMessage = (level: LogLevel, message: string, meta?: LogMeta) => {
+        const fn =
+            (loggerTarget as Record<string, (...args: any[]) => void>)[level] ??
+            console[level] ??
+            console.log
+        if (meta) {
+            fn.call(loggerTarget, message, meta)
+        } else {
+            fn.call(loggerTarget, message)
+        }
+    }
+
+    const logDebug = (message: string, meta?: LogMeta) => logMessage("debug", message, meta)
+    const logInfo = (message: string, meta?: LogMeta) => logMessage("info", message, meta)
+    const logWarn = (message: string, meta?: LogMeta) => logMessage("warn", message, meta)
+    const logError = (message: string, meta?: LogMeta) => logMessage("error", message, meta)
 
     const restoreStoredValues = () => {
         if (typeof window === "undefined") {
@@ -56,8 +88,13 @@
             if (storedQuery) {
                 searchQuery.value = storedQuery
             }
+            logDebug("Restored stored values", {
+                hasClientId: Boolean(clientId.value),
+                hasApiKey: Boolean(apiKey.value),
+                hasQuery: Boolean(searchQuery.value),
+            })
         } catch (error) {
-            console.warn("Unable to restore stored values", error)
+            logWarn("Unable to restore stored values", { error })
         }
     }
 
@@ -109,6 +146,10 @@
             return gapiError.status ? `${gapiError.status}: ${gapiError.message}` : gapiError.message
         }
 
+        if (typeof maybeError.error_description === "string" && maybeError.error_description.trim()) {
+            return maybeError.error_description.trim()
+        }
+
         if (typeof maybeError.error === "string" && maybeError.error.trim()) {
             return maybeError.error.trim()
         }
@@ -141,10 +182,15 @@
     const setStatus = (message: string, type: StatusKind = "info") => {
         statusText.value = message
         statusType.value = type
+        logDebug("Status updated", { message, type })
     }
 
     const ensureCredentials = () => {
         if (!clientId.value.trim() || !apiKey.value.trim()) {
+            logWarn("Missing credentials", {
+                hasClientId: Boolean(clientId.value.trim()),
+                hasApiKey: Boolean(apiKey.value.trim()),
+            })
             throw new Error("Client ID and API key are required.")
         }
     }
@@ -157,12 +203,14 @@
             }
 
             if (googleScriptLoaded.value) {
+                logDebug("Google API script already loaded")
                 resolve()
                 return
             }
 
             if (document.querySelector("script[data-google-apis]")) {
                 googleScriptLoaded.value = true
+                logDebug("Google API script detected in DOM")
                 resolve()
                 return
             }
@@ -174,15 +222,74 @@
             script.dataset.googleApis = "true"
             script.onload = () => {
                 googleScriptLoaded.value = true
+                logInfo("Google API script loaded")
                 resolve()
             }
-            script.onerror = () => reject(new Error("Unable to load the Google APIs script."))
+            script.onerror = (event) => {
+                logError("Unable to load the Google APIs script.", { event })
+                reject(new Error("Unable to load the Google APIs script."))
+            }
             document.head.appendChild(script)
         })
 
+    const loadGisScript = () =>
+        new Promise<void>((resolve, reject) => {
+            if (!isClient.value) {
+                reject(new Error("Google Identity Services script can only be loaded in the browser."))
+                return
+            }
+
+            if (gisScriptLoaded.value) {
+                logDebug("Google Identity Services script already loaded")
+                resolve()
+                return
+            }
+
+            if (document.querySelector("script[data-google-gis]")) {
+                gisScriptLoaded.value = true
+                logDebug("Google Identity Services script detected in DOM")
+                resolve()
+                return
+            }
+
+            const script = document.createElement("script")
+            script.src = "https://accounts.google.com/gsi/client"
+            script.async = true
+            script.defer = true
+            script.dataset.googleGis = "true"
+            script.onload = () => {
+                gisScriptLoaded.value = true
+                logInfo("Google Identity Services script loaded")
+                resolve()
+            }
+            script.onerror = (event) => {
+                logError("Unable to load the Google Identity Services script.", { event })
+                reject(new Error("Unable to load the Google Identity Services script."))
+            }
+            document.head.appendChild(script)
+        })
+
+    const setupTokenClient = () => {
+        const googleAccounts = window.google?.accounts?.oauth2
+        if (!googleAccounts) {
+            throw new Error("Google Identity Services client not available.")
+        }
+
+        tokenClient.value = googleAccounts.initTokenClient({
+            client_id: clientId.value.trim(),
+            scope: scopes.join(" "),
+            prompt: "",
+            callback: () => {
+                /* The callback is overridden before requesting a token. */
+            },
+        })
+        logInfo("Token client initialized", { scopes: scopes.join(" ") })
+    }
+
     const initClient = async () => {
         ensureCredentials()
-        await loadGoogleScript()
+        logInfo("Initializing Gmail API client")
+        await Promise.all([loadGoogleScript(), loadGisScript()])
 
         const gapi = window.gapi
         if (!gapi) {
@@ -190,55 +297,99 @@
         }
 
         await new Promise<void>((resolve, reject) => {
-            gapi.load("client:auth2", async () => {
+            gapi.load("client", async () => {
                 try {
                     await gapi.client.init({
                         apiKey: apiKey.value.trim(),
-                        clientId: clientId.value.trim(),
                         discoveryDocs,
-                        scope: scopes.join(" "),
                     })
 
-                    authInstance.value = gapi.auth2.getAuthInstance()
-                    if (!authInstance.value) {
-                        throw new Error("Failed to create an auth instance.")
-                    }
-
-                    isSignedIn.value = authInstance.value.isSignedIn.get()
-                    authInstance.value.isSignedIn.listen((signedIn: boolean) => {
-                        isSignedIn.value = signedIn
-                        if (!signedIn) {
-                            messages.value = []
-                        }
-                    })
+                    setupTokenClient()
 
                     gapiReady.value = true
                     setStatus("Google API client is initialized.", "success")
+                    logInfo("Google API client initialized")
                     resolve()
                 } catch (err) {
+                    logError("Failed to initialize Google API client", { error: err })
                     reject(err)
                 }
             })
         })
     }
 
+    const requestAccessToken = () =>
+        new Promise<void>((resolve, reject) => {
+            if (!tokenClient.value) {
+                reject(new Error("Token client not ready."))
+                return
+            }
+
+            const promptMode = accessToken.value ? "none" : "consent"
+            logInfo("Requesting Gmail access token", { prompt: promptMode })
+            let settled = false
+            const cleanup = () => {
+                settled = true
+            }
+
+            const handleSuccess = (tokenResponse: any) => {
+                if (settled) {
+                    return
+                }
+                cleanup()
+
+                if (!tokenResponse || tokenResponse.error) {
+                    logError("Token request returned an error payload", { error: tokenResponse })
+                    reject(tokenResponse)
+                    return
+                }
+
+                if (!tokenResponse.access_token) {
+                    reject(new Error("Access token missing from Google response."))
+                    return
+                }
+
+                accessToken.value = tokenResponse.access_token
+                window.gapi?.client?.setToken(tokenResponse)
+                isSignedIn.value = true
+                logInfo("Received Gmail access token")
+                resolve()
+            }
+
+            const handleError = (errorResponse: any) => {
+                if (settled) {
+                    return
+                }
+                cleanup()
+                logError("Google token client reported an error", { error: errorResponse })
+                reject(errorResponse)
+            }
+
+            try {
+                tokenClient.value.callback = handleSuccess
+                ;(tokenClient.value as Record<string, any>).error_callback = handleError
+                const requestOptions: Record<string, string> = {}
+                if (promptMode === "consent") {
+                    requestOptions.prompt = "consent"
+                }
+                tokenClient.value.requestAccessToken(requestOptions)
+            } catch (error) {
+                logError("Token request threw an exception", { error })
+                reject(error)
+            }
+        })
+
     const authorizeGmail = async () => {
         loadingAuthorize.value = true
         try {
             setStatus("Preparing Google authorization flow…", "info")
-            if (!gapiReady.value) {
-                await initClient()
-            }
-
-            if (!authInstance.value) {
-                throw new Error("Auth instance not ready.")
-            }
-
-            await authInstance.value.signIn()
-            isSignedIn.value = true
+            logInfo("Starting Gmail authorization flow")
+            await initClient()
+            await requestAccessToken()
             setStatus("Authorization successful. You can now search Gmail.", "success")
+            logInfo("Gmail authorization completed")
         } catch (error) {
-            console.error("authorizeGmail failed", error)
+            logError("Gmail authorization failed", { error })
             setStatus(normalizeError(error, "Authorization failed."), "error")
         } finally {
             loadingAuthorize.value = false
@@ -246,14 +397,24 @@
     }
 
     const signOut = async () => {
-        if (!authInstance.value) {
-            return
+        logInfo("Signing out from Gmail")
+        if (accessToken.value) {
+            await new Promise<void>((resolve) => {
+                const googleAccounts = window.google?.accounts?.oauth2
+                if (!googleAccounts) {
+                    resolve()
+                    return
+                }
+                googleAccounts.revoke(accessToken.value, () => resolve())
+            })
         }
 
-        await authInstance.value.signOut()
+        window.gapi?.client?.setToken(null)
+        accessToken.value = ""
         isSignedIn.value = false
         messages.value = []
         setStatus("Disconnected from Gmail.", "info")
+        logInfo("Completed sign out")
     }
 
     const parseHeader = (
@@ -274,6 +435,7 @@
 
         loadingSearch.value = true
         setStatus("Contacting Gmail...", "info")
+        logInfo("Searching Gmail mailbox", { query: searchQuery.value.trim() })
 
         try {
             const gapi = window.gapi
@@ -319,8 +481,9 @@
                 }.`,
                 "success"
             )
+            logInfo("Fetched Gmail messages", { count: detailedMessages.length })
         } catch (error) {
-            console.error("searchMailbox failed", error)
+            logError("Gmail search failed", { error })
             setStatus(normalizeError(error, "Unable to search Gmail."), "error")
         } finally {
             loadingSearch.value = false
@@ -435,6 +598,10 @@
                     <li>
                         <span>Google script</span>
                         <strong>{{ googleScriptLoaded ? "Loaded" : "Not loaded" }}</strong>
+                    </li>
+                    <li>
+                        <span>Identity script</span>
+                        <strong>{{ gisScriptLoaded ? "Loaded" : "Not loaded" }}</strong>
                     </li>
                     <li>
                         <span>API client</span>
