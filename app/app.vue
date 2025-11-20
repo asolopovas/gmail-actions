@@ -307,6 +307,14 @@
     const initClient = async () => {
         ensureCredentials()
         logInfo("Initializing Gmail API client")
+        const providedApiKey = apiKey.value.trim()
+        if (providedApiKey) {
+            logWarn("Ignoring provided API key; using OAuth-only flow", { keyLength: providedApiKey.length })
+            apiKey.value = ""
+            if (typeof window !== "undefined") {
+                localStorage.removeItem(STORAGE_KEYS.apiKey)
+            }
+        }
         await Promise.all([loadGoogleScript(), loadGisScript()])
 
         const gapi = window.gapi
@@ -317,17 +325,12 @@
         await new Promise<void>((resolve, reject) => {
             gapi.load("client", async () => {
                 try {
-                    const initOptions: Record<string, any> = { discoveryDocs }
-                    if (apiKey.value.trim()) {
-                        initOptions.apiKey = apiKey.value.trim()
-                    }
-
                     logInfo("Initializing gapi client with config", {
-                        hasApiKey: Boolean(initOptions.apiKey),
+                        hasApiKey: false,
                         discoveryDocs,
                     })
 
-                    await gapi.client.init(initOptions)
+                    await gapi.client.init({ discoveryDocs })
 
                     setupTokenClient()
 
