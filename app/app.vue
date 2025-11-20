@@ -474,6 +474,29 @@
         return email
     }
 
+    const formatDate = (input: string) => {
+        if (!input) return "Unknown date"
+        const date = new Date(input)
+        if (Number.isNaN(date.getTime())) {
+            return input
+        }
+
+        const pad = (val: number) => val.toString().padStart(2, "0")
+        const dd = pad(date.getDate())
+        const mm = pad(date.getMonth() + 1)
+        const yyyy = date.getFullYear()
+        const hh = pad(date.getHours())
+        const min = pad(date.getMinutes())
+        return `${dd}/${mm}/${yyyy} ${hh}:${min}`
+    }
+
+    const makeExcerpt = (text: string, limit = 220) => {
+        const normalized = text.replace(/\s+/g, " ").trim()
+        if (!normalized) return ""
+        if (normalized.length <= limit) return normalized
+        return `${normalized.slice(0, limit)}…`
+    }
+
     const addOrUpdateAccount = (email: string, token: string) => {
         const existing = accounts.value.find((account) => account.email === email)
         if (existing) {
@@ -572,14 +595,15 @@
 
                         const headers = detail.result.payload?.headers ?? []
                         const bodyText = extractPlainBody(detail.result.payload)
+                        const rawDate = parseHeader(headers, "Date") || "Unknown date"
                         const result: GmailMessage = {
                             id: message.id,
                             threadId: message.threadId,
                             subject: parseHeader(headers, "Subject") || "(No subject)",
                             from: parseHeader(headers, "From") || "Unknown sender",
                             to: parseHeader(headers, "To") || "Unknown recipient",
-                            date: parseHeader(headers, "Date") || "Unknown date",
-                            body: bodyText || detail.result.snippet || "",
+                            date: formatDate(rawDate),
+                            body: makeExcerpt(bodyText || detail.result.snippet || ""),
                             accountEmail: email,
                         }
                         return result
