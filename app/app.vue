@@ -617,10 +617,10 @@
         <main class="gmail-card">
             <header class="gmail-card__header">
                 <p class="eyebrow">Gmail actions</p>
-                <h1>Authorize Gmail &amp; search email contents</h1>
+                <h1>Search Gmail across multiple accounts</h1>
                 <p class="lede">
-                    Connect your Google account with OAuth 2.0, then run advanced Gmail search
-                    queries directly from this workspace. Nothing is stored on our servers.
+                    Connect multiple Gmail accounts, select which inboxes to include, and review matched
+                    messages in compact cards.
                 </p>
             </header>
 
@@ -633,11 +633,106 @@
 
             <section class="panel">
                 <div class="panel__title">
-                    <h2>1. Configure Google Cloud credentials</h2>
-                    <p>
-                        Use a Web OAuth Client ID with the Gmail API enabled inside Google Cloud
-                        Console.
+                    <h2>Search inboxes</h2>
+                    <p>Run Gmail queries across all authorized accounts.</p>
+                </div>
+
+                <form
+                    class="search"
+                    @submit.prevent="searchMailbox"
+                >
+                    <label class="form-field">
+                        <span>Search query</span>
+                        <input
+                            v-model="searchQuery"
+                            type="text"
+                            name="search"
+                            autocomplete="off"
+                            placeholder='subject:"weekly report" newer_than:7d'
+                            :disabled="!readyForSearch"
+                        />
+                    </label>
+
+                    <div
+                        v-if="accounts.length"
+                        class="accounts"
+                    >
+                        <div class="accounts__header">
+                            <p class="accounts__title">Authorized accounts</p>
+                            <p class="accounts__subtitle">Select inboxes to search.</p>
+                        </div>
+
+                        <div class="accounts__list">
+                            <label
+                                v-for="account in accounts"
+                                :key="account.email"
+                                class="account-chip"
+                            >
+                                <input
+                                    v-model="selectedAccounts"
+                                    type="checkbox"
+                                    :value="account.email"
+                                />
+                                <span>{{ account.email }}</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="actions">
+                        <button
+                            class="btn"
+                            type="submit"
+                            :disabled="!readyForSearch || loadingSearch"
+                        >
+                            {{ loadingSearch ? "Searching…" : "Search inboxes" }}
+                        </button>
+                    </div>
+                </form>
+
+                <div
+                    v-if="!isSignedIn"
+                    class="placeholder"
+                >
+                    Authorize Gmail to enable search.
+                </div>
+
+                <div
+                    v-else
+                    class="results"
+                >
+                    <p
+                        v-if="!messages.length && !loadingSearch"
+                        class="placeholder"
+                    >
+                        No messages loaded yet.
                     </p>
+                    <div v-else class="cards">
+                        <article
+                            v-for="message in messages"
+                            :key="message.id"
+                            class="email-card"
+                        >
+                            <header>
+                                <div>
+                                    <p class="email-card__subject">{{ message.subject }}</p>
+                                    <p class="email-card__from">From: {{ message.from }}</p>
+                                    <p class="email-card__to">To: {{ message.to }}</p>
+                                </div>
+                                <div class="email-card__meta">
+                                    <span class="pill">{{ message.accountEmail }}</span>
+                                    <p class="email-card__date">{{ message.date }}</p>
+                                </div>
+                            </header>
+                            <p class="email-card__body">{{ message.body }}</p>
+                        </article>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel">
+                <div class="panel__title">
+                    <h2>Authorization</h2>
+                    <p>Use your Web OAuth Client ID (no API key needed) and connect Gmail.</p>
                 </div>
 
                 <div class="form-grid">
@@ -651,49 +746,6 @@
                             placeholder="1234567890-example.apps.googleusercontent.com"
                         />
                     </label>
-
-                    <label class="form-field">
-                        <span>API key</span>
-                        <input
-                            v-model="apiKey"
-                            type="text"
-                            name="api-key"
-                            autocomplete="off"
-                            placeholder="Optional – leave blank to rely on OAuth"
-                        />
-                    </label>
-                </div>
-
-                <div class="scopes">
-                    <p>Requested scopes</p>
-                    <div class="scope-tags">
-                        <span
-                            v-for="scope in scopes"
-                            :key="scope"
-                            class="tag"
-                            >{{ scope }}</span
-                        >
-                    </div>
-                </div>
-
-                <div class="callout">
-                    <p class="callout__title">Google Cloud setup checklist</p>
-                    <ul>
-                        <li>
-                            <span>Authorized JavaScript origin</span>
-                            <code>
-                                {{ currentOrigin || "Open this page in a browser to copy the origin." }}
-                            </code>
-                        </li>
-                        <li>
-                            <span>Authorized redirect URI</span>
-                            <code>{{ oauthRedirectUri }}</code>
-                        </li>
-                        <li>
-                            <span>Browser</span>
-                            <em>Allow third-party cookies and pop-ups for Google Sign-In.</em>
-                        </li>
-                    </ul>
                 </div>
 
                 <div class="actions">
@@ -733,113 +785,6 @@
                         <strong>{{ isSignedIn ? "Connected" : "Not connected" }}</strong>
                     </li>
                 </ul>
-
-                <div
-                    v-if="accounts.length"
-                    class="accounts"
-                >
-                    <div class="accounts__header">
-                        <p class="accounts__title">Authorized accounts</p>
-                        <p class="accounts__subtitle">Select which inboxes to include in searches.</p>
-                    </div>
-
-                    <div class="accounts__list">
-                        <label
-                            v-for="account in accounts"
-                            :key="account.email"
-                            class="account-chip"
-                        >
-                            <input
-                                v-model="selectedAccounts"
-                                type="checkbox"
-                                :value="account.email"
-                            />
-                            <span>{{ account.email }}</span>
-                        </label>
-                    </div>
-                </div>
-            </section>
-
-            <section class="panel">
-                <div class="panel__title">
-                    <h2>2. Search Gmail</h2>
-                    <p>
-                        Use Gmail search syntax (e.g. <code>from:customer has:attachment</code>) to
-                        narrow down the results.
-                    </p>
-                </div>
-
-                <form
-                    class="search"
-                    @submit.prevent="searchMailbox"
-                >
-                    <label class="form-field">
-                        <span>Search query</span>
-                        <input
-                            v-model="searchQuery"
-                            type="text"
-                            name="search"
-                            autocomplete="off"
-                            placeholder='subject:"weekly report" newer_than:7d'
-                            :disabled="!readyForSearch"
-                        />
-                    </label>
-                    <div class="actions">
-                        <button
-                            class="btn"
-                            type="submit"
-                            :disabled="!readyForSearch || loadingSearch"
-                        >
-                            {{ loadingSearch ? "Searching…" : "Search mailbox" }}
-                        </button>
-                    </div>
-                </form>
-
-                <div
-                    v-if="!isSignedIn"
-                    class="placeholder"
-                >
-                    Authorize Gmail to enable search.
-                </div>
-
-                <div
-                    v-else
-                    class="results"
-                >
-                    <p
-                        v-if="!messages.length && !loadingSearch"
-                        class="placeholder"
-                    >
-                        No messages loaded yet.
-                    </p>
-                    <div v-else class="table-wrapper">
-                        <table class="messages-table">
-                            <thead>
-                                <tr>
-                                    <th>Account</th>
-                                    <th>From</th>
-                                    <th>To</th>
-                                    <th>Subject</th>
-                                    <th>Date</th>
-                                    <th>Body</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <tr
-                                    v-for="message in messages"
-                                    :key="message.id"
-                                >
-                                    <td>{{ message.accountEmail }}</td>
-                                    <td>{{ message.from }}</td>
-                                    <td>{{ message.to }}</td>
-                                    <td>{{ message.subject }}</td>
-                                    <td>{{ message.date }}</td>
-                                    <td class="body-cell">{{ message.body }}</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
             </section>
         </main>
     </div>
@@ -964,74 +909,6 @@
         outline: none;
         box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
     }
-
-.scopes {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-}
-
-.scope-tags {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-}
-
-.tag {
-    background: #e0e7ff;
-    color: #312e81;
-    padding: 6px 12px;
-    border-radius: 999px;
-    font-size: 0.85rem;
-}
-
-.callout {
-    border-radius: 16px;
-    border: 1px solid #c7d2fe;
-    background: #eef2ff;
-    padding: 16px 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    color: #312e81;
-}
-
-.callout__title {
-    margin: 0;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-    font-size: 0.85rem;
-}
-
-.callout ul {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-}
-
-.callout li {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
-
-.callout code {
-    background: rgba(49, 46, 129, 0.1);
-    border-radius: 8px;
-    padding: 4px 8px;
-    font-size: 0.9rem;
-    word-break: break-all;
-}
-
-.callout em {
-    font-style: normal;
-    font-size: 0.9rem;
-    color: #4338ca;
-}
 
     .actions {
         display: flex;
@@ -1161,37 +1038,74 @@
     gap: 16px;
 }
 
-.table-wrapper {
-    width: 100%;
-    overflow-x: auto;
-}
+    .cards {
+        display: grid;
+        gap: 14px;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
 
-.messages-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.95rem;
-}
+    .email-card {
+        border: 1px solid #e2e8f0;
+        border-radius: 16px;
+        padding: 16px;
+        background: #fff;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
+    }
 
-.messages-table th,
-.messages-table td {
-    padding: 12px 10px;
-    border-bottom: 1px solid #e2e8f0;
-    text-align: left;
-}
+    .email-card header {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: flex-start;
+    }
 
-.messages-table th {
-    background: #f8fafc;
-    color: #0f172a;
-    position: sticky;
-    top: 0;
-}
+    .email-card__subject {
+        margin: 0;
+        font-weight: 700;
+        color: #0f172a;
+    }
 
-.body-cell {
-    max-width: 320px;
-    white-space: pre-wrap;
-    word-break: break-word;
-    color: #475569;
-}
+    .email-card__from,
+    .email-card__to {
+        margin: 2px 0 0;
+        color: #475569;
+        font-size: 0.9rem;
+    }
+
+    .email-card__meta {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 6px;
+    }
+
+    .email-card__date {
+        margin: 0;
+        color: #475569;
+        font-size: 0.85rem;
+    }
+
+    .email-card__body {
+        margin: 0;
+        color: #475569;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 0.95rem;
+        line-height: 1.5;
+    }
+
+    .pill {
+        display: inline-flex;
+        align-items: center;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: #eef2ff;
+        color: #312e81;
+        font-size: 0.85rem;
+    }
 
     @media (max-width: 720px) {
         .gmail-card {
