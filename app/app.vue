@@ -23,6 +23,7 @@
         to: string
         date: string
         body: string
+        fullBody: string
         accountEmail: string
     }
 
@@ -63,6 +64,7 @@
     const loadingAuthorize = ref(false)
     const loadingSearch = ref(false)
     const messages = ref<GmailMessage[]>([])
+    const selectedMessage = ref<GmailMessage | null>(null)
     const isClient = ref(false)
     const currentOrigin = ref("")
     const oauthRedirectUri = computed(() =>
@@ -618,6 +620,7 @@
         persistAccounts()
         isSignedIn.value = false
         messages.value = []
+        selectedMessage.value = null
         setStatus("Disconnected from Gmail.", "info")
         logInfo("Completed sign out")
     }
@@ -715,6 +718,14 @@
         persistAccounts()
     }
 
+    const openMessage = (message: GmailMessage) => {
+        selectedMessage.value = message
+    }
+
+    const closeModal = () => {
+        selectedMessage.value = null
+    }
+
     const extractPlainBody = (payload: any): string => {
         if (!payload) {
             return ""
@@ -774,6 +785,7 @@
         loadingSearch.value = true
         setStatus("Contacting Gmail...", "info")
         logInfo("Searching Gmail mailbox", { query: effectiveQuery, accounts: targets })
+        selectedMessage.value = null
 
         try {
             const gapi = window.gapi
@@ -821,6 +833,7 @@
 
                         const headers = detail.result.payload?.headers ?? []
                         const bodyText = extractPlainBody(detail.result.payload)
+                        const fullBody = bodyText || detail.result.snippet || ""
                         const rawDate = parseHeader(headers, "Date") || "Unknown date"
                         const result: GmailMessage = {
                             id: message.id,
@@ -829,7 +842,8 @@
                             from: parseHeader(headers, "From") || "Unknown sender",
                             to: parseHeader(headers, "To") || "Unknown recipient",
                             date: formatDate(rawDate),
-                            body: makeExcerpt(bodyText || detail.result.snippet || ""),
+                            body: makeExcerpt(fullBody),
+                            fullBody,
                             accountEmail: email,
                         }
                         return result
@@ -1027,11 +1041,20 @@
                                     <p class="email-card__date">{{ message.date }}</p>
                                 </div>
                             </header>
-                    <p class="email-card__body">{{ message.body }}</p>
-                </article>
-            </div>
-        </div>
-    </section>
+                            <p class="email-card__body">{{ message.body }}</p>
+                            <div class="email-card__footer">
+                                <button
+                                    class="btn btn--ghost btn--tiny"
+                                    type="button"
+                                    @click="openMessage(message)"
+                                >
+                                    View message
+                                </button>
+                            </div>
+                        </article>
+                    </div>
+                </div>
+            </section>
 
             <section class="panel">
                 <div class="panel__title">
@@ -1072,6 +1095,35 @@
                 </ul>
             </section>
         </main>
+
+        <div
+            v-if="selectedMessage"
+            class="modal-overlay"
+            @click.self="closeModal"
+        >
+            <div class="modal">
+                <button
+                    class="modal__close"
+                    type="button"
+                    @click="closeModal"
+                    aria-label="Close"
+                >
+                    X
+                </button>
+                <p class="modal__eyebrow">Full message</p>
+                <h3 class="modal__subject">{{ selectedMessage.subject }}</h3>
+                <div class="modal__meta">
+                    <span class="pill">{{ selectedMessage.accountEmail }}</span>
+                    <span class="modal__date">{{ selectedMessage.date }}</span>
+                </div>
+                <p class="modal__from">From: {{ selectedMessage.from }}</p>
+                <p class="modal__to">To: {{ selectedMessage.to }}</p>
+                <div class="modal__body">
+                    <p v-if="selectedMessage.fullBody">{{ selectedMessage.fullBody }}</p>
+                    <p v-else class="modal__empty">No body content available.</p>
+                </div>
+            </div>
+        </div>
     </div>
 </template>
 
@@ -1363,7 +1415,7 @@
     .cards {
         display: grid;
         gap: 14px;
-        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        grid-template-columns: 1fr;
     }
 
     .email-card {
@@ -1373,7 +1425,7 @@
         background: #fff;
         display: flex;
         flex-direction: column;
-        gap: 10px;
+        gap: 12px;
         box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
     }
 
@@ -1419,6 +1471,11 @@
         line-height: 1.5;
     }
 
+    .email-card__footer {
+        display: flex;
+        justify-content: flex-end;
+    }
+
     .pill {
         display: inline-flex;
         align-items: center;
@@ -1432,6 +1489,99 @@
     .pill--warn {
         background: #fef3c7;
         color: #92400e;
+    }
+
+    .modal-overlay {
+        position: fixed;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.55);
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+        padding: 32px 16px;
+        overflow-y: auto;
+        z-index: 10;
+    }
+
+    .modal {
+        position: relative;
+        background: #fff;
+        border-radius: 16px;
+        padding: 24px;
+        width: min(820px, 100%);
+        box-shadow: 0 30px 80px rgba(15, 23, 42, 0.35);
+        color: #0f172a;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+    }
+
+    .modal__close {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        border: none;
+        background: transparent;
+        font-size: 1.5rem;
+        cursor: pointer;
+        color: #475569;
+        line-height: 1;
+    }
+
+    .modal__eyebrow {
+        margin: 0;
+        text-transform: uppercase;
+        letter-spacing: 0.15em;
+        color: #6366f1;
+        font-weight: 700;
+        font-size: 0.75rem;
+    }
+
+    .modal__subject {
+        margin: 4px 0;
+        font-size: 1.4rem;
+        color: #0f172a;
+    }
+
+    .modal__meta {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0 0 4px;
+    }
+
+    .modal__date {
+        color: #475569;
+        font-size: 0.9rem;
+    }
+
+    .modal__from,
+    .modal__to {
+        margin: 0;
+        color: #475569;
+        font-size: 0.95rem;
+    }
+
+    .modal__body {
+        margin-top: 6px;
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 14px;
+    }
+
+    .modal__body p {
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        color: #0f172a;
+        line-height: 1.6;
+    }
+
+    .modal__body .modal__empty {
+        color: #475569;
+        font-size: 0.95rem;
+        margin: 0;
     }
 
     @media (max-width: 720px) {
