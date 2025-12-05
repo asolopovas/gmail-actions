@@ -1,4 +1,5 @@
-import { computed, onMounted, ref, watch, useNuxtApp } from "#imports"
+import { computed, onMounted, ref, useNuxtApp, watch } from "#imports"
+import { useLocalStorage, useScriptTag } from "@vueuse/core"
 
 declare global {
     interface Window {
@@ -38,36 +39,15 @@ export const STORAGE_KEYS = {
 type LogMeta = Record<string, unknown>
 type LogLevel = "debug" | "info" | "warn" | "error"
 
-const KNOWN_ERROR_HINTS: Array<{ match: (message: string) => boolean; hint: string }> = [
-    {
-        match: (message) => message.includes("idpiframe_initialization_failed"),
-        hint:
-            "Google Sign-In cannot start. Add your development origin (e.g. http://localhost:3000) to the OAuth client's Authorized JavaScript origins, and allow third-party cookies/pop-ups for this site.",
-    },
-    {
-        match: (message) => message.includes("popup_blocked_by_browser"),
-        hint: "Your browser blocked Google's popup. Allow popups for this site and try again.",
-    },
-    {
-        match: (message) =>
-            message.toLowerCase().includes("api key not valid") ||
-            message.toLowerCase().includes("api key") ||
-            (message.toLowerCase().includes("key") && message.toLowerCase().includes("invalid")),
-        hint:
-            "API key appears invalid or restricted. Make sure the key is unrestricted or allows http://localhost:3000 as an HTTP referrer and that the Gmail API is enabled for the project. You can also leave the API key blank and rely on OAuth only.",
-    },
-]
-
 export const useGmailAuth = () => {
-    const clientId = ref("")
-    const apiKey = ref("")
+    const clientId = useLocalStorage<string>(STORAGE_KEYS.clientId, "")
     const googleScriptLoaded = ref(false)
     const gisScriptLoaded = ref(false)
     const gapiReady = ref(false)
     const tokenClient = ref<any | null>(null)
     const accessToken = ref("")
-    const accounts = ref<AccountSession[]>([])
-    const selectedAccounts = ref<string[]>([])
+    const accounts = useLocalStorage<AccountSession[]>(STORAGE_KEYS.accounts, [])
+    const selectedAccounts = useLocalStorage<string[]>(STORAGE_KEYS.selectedAccounts, [])
     const isSignedIn = ref(false)
     const statusText = ref("Provide your Client ID and API key, then authorize access to Gmail.")
     const statusType = ref<StatusKind>("info")
@@ -121,68 +101,6 @@ export const useGmailAuth = () => {
         return normalized
     }
 
-    const restoreStoredValues = () => {
-        if (typeof window === "undefined") {
-            return
-        }
-
-        try {
-            clientId.value = localStorage.getItem(STORAGE_KEYS.clientId) ?? ""
-            apiKey.value = localStorage.getItem(STORAGE_KEYS.apiKey) ?? ""
-
-            const storedAccounts = localStorage.getItem(STORAGE_KEYS.accounts)
-            if (storedAccounts) {
-                accounts.value = normalizeAccounts(JSON.parse(storedAccounts))
-            }
-
-            const storedSelected = localStorage.getItem(STORAGE_KEYS.selectedAccounts)
-            if (storedSelected) {
-                const parsed = JSON.parse(storedSelected)
-                selectedAccounts.value = Array.isArray(parsed)
-                    ? parsed.filter((item: unknown) => typeof item === "string")
-                    : []
-            }
-
-            const validEmails = new Set(accounts.value.map((a) => a.email))
-            selectedAccounts.value = selectedAccounts.value.filter((email) => validEmails.has(email))
-
-            if (!selectedAccounts.value.length && accounts.value.length) {
-                selectedAccounts.value = accounts.value.map((a) => a.email)
-            }
-
-            logDebug("Restored stored auth values", {
-                hasClientId: Boolean(clientId.value),
-                hasApiKey: Boolean(apiKey.value),
-                storedAccounts: accounts.value.length,
-                selectedAccounts: selectedAccounts.value.length,
-            })
-        } catch (error) {
-            logWarn("Unable to restore stored auth values", { error })
-        }
-    }
-
-    const persistAccounts = () => {
-        if (typeof window === "undefined") return
-        localStorage.setItem(STORAGE_KEYS.accounts, JSON.stringify(accounts.value))
-        localStorage.setItem(STORAGE_KEYS.selectedAccounts, JSON.stringify(selectedAccounts.value))
-    }
-
-    if (typeof window !== "undefined") {
-        watch(clientId, (value) => {
-            localStorage.setItem(STORAGE_KEYS.clientId, value.trim())
-        })
-        watch(
-            accounts,
-            () => {
-                persistAccounts()
-            },
-            { deep: true }
-        )
-        watch(selectedAccounts, (value) => {
-            localStorage.setItem(STORAGE_KEYS.selectedAccounts, JSON.stringify(value))
-        })
-    }
-
     const extractGoogleErrorMessage = (error: unknown) => {
         if (!error || typeof error !== "object") {
             return ""
@@ -220,25 +138,13 @@ export const useGmailAuth = () => {
         return ""
     }
 
-    const attachFriendlyHint = (message: string) => {
-        const match = KNOWN_ERROR_HINTS.find((entry) => entry.match(message))
-        return match ? `${message} – ${match.hint}` : message
-    }
-
     const normalizeError = (error: unknown, fallback = "Something went wrong.") => {
-        if (typeof error === "string") {
-            return attachFriendlyHint(error)
-        }
-
+        if (typeof error === "string") return error
         const enriched = extractGoogleErrorMessage(error)
-        if (enriched) {
-            return attachFriendlyHint(enriched)
-        }
-
+        if (enriched) return enriched
         if (error && typeof error === "object" && "message" in error) {
-            return attachFriendlyHint(String((error as Error).message || fallback))
+            return String((error as Error).message || fallback)
         }
-
         return fallback
     }
 
@@ -253,84 +159,65 @@ export const useGmailAuth = () => {
             logWarn("Missing client ID")
             throw new Error("Client ID is required.")
         }
-        if (!apiKey.value.trim()) {
-            logWarn("API key not provided; continuing without a key")
+    }
+
+    accounts.value = normalizeAccounts(accounts.value)
+    selectedAccounts.value = Array.isArray(selectedAccounts.value)
+        ? selectedAccounts.value.filter((email) => typeof email === "string")
+        : []
+
+    watch(
+        accounts,
+        (list) => {
+            const validEmails = new Set(list.map((a) => a.email))
+            selectedAccounts.value = selectedAccounts.value.filter((email) => validEmails.has(email))
+            if (!selectedAccounts.value.length && list.length) {
+                selectedAccounts.value = list.map((a) => a.email)
+            }
+            isSignedIn.value = list.length > 0
+        },
+        { deep: true, immediate: true }
+    )
+
+    const googleApiScript = useScriptTag(
+        "https://apis.google.com/js/api.js",
+        () => {
+            googleScriptLoaded.value = true
+            logInfo("Google API script loaded")
+        },
+        { manual: true }
+    )
+
+    const gisScript = useScriptTag(
+        "https://accounts.google.com/gsi/client",
+        () => {
+            gisScriptLoaded.value = true
+            logInfo("Google Identity Services script loaded")
+        },
+        { manual: true }
+    )
+
+    const loadGoogleScript = async () => {
+        if (!isClient.value) {
+            throw new Error("Google API script can only be loaded in the browser.")
+        }
+        if (googleScriptLoaded.value) return
+        const el = await googleApiScript.load()
+        if (!el) {
+            throw new Error("Unable to load the Google APIs script.")
         }
     }
 
-    const loadGoogleScript = () =>
-        new Promise<void>((resolve, reject) => {
-            if (!isClient.value) {
-                reject(new Error("Google API script can only be loaded in the browser."))
-                return
-            }
-
-            if (googleScriptLoaded.value) {
-                logDebug("Google API script already loaded")
-                resolve()
-                return
-            }
-
-            if (document.querySelector("script[data-google-apis]")) {
-                googleScriptLoaded.value = true
-                logDebug("Google API script detected in DOM")
-                resolve()
-                return
-            }
-
-            const script = document.createElement("script")
-            script.src = "https://apis.google.com/js/api.js"
-            script.async = true
-            script.defer = true
-            script.dataset.googleApis = "true"
-            script.onload = () => {
-                googleScriptLoaded.value = true
-                logInfo("Google API script loaded")
-                resolve()
-            }
-            script.onerror = (event) => {
-                logError("Unable to load the Google APIs script.", { event })
-                reject(new Error("Unable to load the Google APIs script."))
-            }
-            document.head.appendChild(script)
-        })
-
-    const loadGisScript = () =>
-        new Promise<void>((resolve, reject) => {
-            if (!isClient.value) {
-                reject(new Error("Google Identity Services script can only be loaded in the browser."))
-                return
-            }
-
-            if (gisScriptLoaded.value) {
-                logDebug("Google Identity Services script already loaded")
-                resolve()
-                return
-            }
-
-            if (document.querySelector("script[data-google-gis]")) {
-                gisScriptLoaded.value = true
-                logDebug("Google Identity Services script detected in DOM")
-                resolve()
-                return
-            }
-
-            const script = document.createElement("script")
-            script.src = "https://accounts.google.com/gsi/client"
-            script.async = true
-            script.defer = true
-            script.dataset.googleGis = "true"
-            script.onload = () => {
-                gisScriptLoaded.value = true
-                logInfo("Google Identity Services script loaded")
-                resolve()
-            }
-            script.onerror = (event) => {
-                logError("Unable to load the Google Identity Services script.", { event })
-                reject(new Error("Unable to load the Google Identity Services script."))
-            }
-            document.head.appendChild(script)
-        })
+    const loadGisScript = async () => {
+        if (!isClient.value) {
+            throw new Error("Google Identity Services script can only be loaded in the browser.")
+        }
+        if (gisScriptLoaded.value) return
+        const el = await gisScript.load()
+        if (!el) {
+            throw new Error("Unable to load the Google Identity Services script.")
+        }
+    }
 
     const setupTokenClient = (force = false) => {
         if (tokenClient.value && !force) {
@@ -355,14 +242,6 @@ export const useGmailAuth = () => {
     const initClient = async () => {
         ensureCredentials()
         logInfo("Initializing Gmail API client")
-        const providedApiKey = apiKey.value.trim()
-        if (providedApiKey) {
-            logWarn("Ignoring provided API key; using OAuth-only flow", { keyLength: providedApiKey.length })
-            apiKey.value = ""
-            if (typeof window !== "undefined") {
-                localStorage.removeItem(STORAGE_KEYS.apiKey)
-            }
-        }
         await Promise.all([loadGoogleScript(), loadGisScript()])
 
         const gapi = window.gapi
@@ -491,7 +370,6 @@ export const useGmailAuth = () => {
 
         isSignedIn.value = accounts.value.length > 0
         logInfo("Account stored", { email, total: accounts.value.length })
-        persistAccounts()
     }
 
     const restoreAccountsSilently = async () => {
@@ -509,7 +387,6 @@ export const useGmailAuth = () => {
                 }
             }
         }
-        persistAccounts()
     }
 
     const authorizeAccount = async (hint?: string, opts?: { forcePrompt?: boolean; forceSelectAccount?: boolean }) => {
@@ -618,7 +495,6 @@ export const useGmailAuth = () => {
         accessToken.value = ""
         accounts.value = []
         selectedAccounts.value = []
-        persistAccounts()
         isSignedIn.value = false
         setStatus("Disconnected from Gmail.", "info")
         logInfo("Completed sign out")
@@ -639,7 +515,6 @@ export const useGmailAuth = () => {
 
         accounts.value = accounts.value.filter((a) => a.email !== email)
         selectedAccounts.value = selectedAccounts.value.filter((e) => e !== email)
-        persistAccounts()
         isSignedIn.value = accounts.value.length > 0
         logInfo("Removed account", { email })
     }
@@ -647,11 +522,6 @@ export const useGmailAuth = () => {
     onMounted(async () => {
         isClient.value = true
         currentOrigin.value = window.location.origin
-        restoreStoredValues()
-
-        if (accounts.value.length) {
-            isSignedIn.value = true
-        }
 
         if (clientId.value.trim()) {
             try {
@@ -664,7 +534,6 @@ export const useGmailAuth = () => {
 
     return {
         clientId,
-        apiKey,
         googleScriptLoaded,
         gisScriptLoaded,
         gapiReady,
